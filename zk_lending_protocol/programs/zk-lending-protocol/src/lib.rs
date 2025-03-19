@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::clock::Clock;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 declare_id!("N36WGuo9LKUWeDBCKPcmrW8ykCgECxQsMqxzaVdzQmg");
@@ -7,28 +8,32 @@ declare_id!("N36WGuo9LKUWeDBCKPcmrW8ykCgECxQsMqxzaVdzQmg");
 pub mod zk_lending_protocol {
     use super::*;
 
-    /// Initialize the global protocol state.
+    /// Initializes the protocol state and treasury.
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let protocol_state = &mut ctx.accounts.protocol_state;
         protocol_state.total_collateral = 0;
         protocol_state.total_loans = 0;
         protocol_state.total_liquidity = 0;
-        protocol_state.base_interest_rate = 5; // e.g., 5%
+        protocol_state.base_interest_rate = 5; // e.g., 5% per annum (example)
         protocol_state.utilization_rate = 0;
+        protocol_state.min_collateral_lock_time = 600; // e.g., 600 seconds = 10 minutes
+
+        let treasury = &mut ctx.accounts.protocol_treasury;
+        treasury.total_fees_collected = 0;
+        treasury.governance_fund = 0;
         Ok(())
     }
 
-    /// Stake collateral with ZK-SNARK proof verification.
-    /// Supports multiple collateral types by using a dedicated CollateralPool account.
+    /// Stake collateral into a specific collateral pool.
     pub fn stake_collateral(
         ctx: Context<StakeCollateral>,
         amount: u64,
         zk_proof: Vec<u8>,
     ) -> Result<()> {
-        // Replace the dummy proof verification with your actual ZK verifier.
+        // Validate proof (placeholder).
         require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
 
-        // Transfer collateral tokens from the user to the collateral pool escrow.
+        // Transfer collateral tokens from user to collateral pool escrow.
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_collateral_account.to_account_info(),
             to: ctx.accounts.collateral_pool_token_account.to_account_info(),
@@ -39,7 +44,7 @@ pub mod zk_lending_protocol {
             amount,
         )?;
 
-        // Update the borrower's confidential collateral amount (encrypted).
+        // Update the borrower's encrypted collateral.
         let borrower_account = &mut ctx.accounts.borrower_account;
         borrower_account.encrypted_collateral = update_encrypted_value(
             borrower_account.encrypted_collateral.clone(),
@@ -47,7 +52,7 @@ pub mod zk_lending_protocol {
             true,
         );
 
-        // Update the collateral pool state.
+        // Update collateral pool state.
         let collateral_pool = &mut ctx.accounts.collateral_pool;
         collateral_pool.total_collateral = collateral_pool
             .total_collateral
@@ -56,24 +61,44 @@ pub mod zk_lending_protocol {
         Ok(())
     }
 
-    /// Borrow funds against staked collateral using a ZK proof to verify collateral sufficiency.
+    /// Normal borrowing instruction with flash loan protection and treasury fee collection.
     pub fn borrow(
         ctx: Context<Borrow>,
         amount: u64,
         zk_proof: Vec<u8>,
     ) -> Result<()> {
+        // Verify ZK proof.
         require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
 
-        // Check that the borrower’s encrypted collateral (via a ZK proof) is sufficient.
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
+        let borrower_account = &mut ctx.accounts.borrower_account;
+        let protocol_state = &mut ctx.accounts.protocol_state;
+
+        // Flash loan protection: if already borrowed, require minimum lock time.
+        if borrower_account.borrow_timestamp > 0 {
+            require!(
+                now - borrower_account.borrow_timestamp >= protocol_state.min_collateral_lock_time,
+                ZKError::CollateralLockTimeNotMet
+            );
+        }
+        // Set the borrow timestamp.
+        borrower_account.borrow_timestamp = now;
+
+        // Check encrypted collateral sufficiency.
         require!(
             has_sufficient_collateral(
-                ctx.accounts.borrower_account.encrypted_collateral.clone(),
+                borrower_account.encrypted_collateral.clone(),
                 amount
             ),
             ZKError::InsufficientCollateral
         );
 
-        // Transfer borrowed tokens from the lending pool escrow to the borrower.
+        // Deduct a borrow fee (e.g., 1%).
+        let fee = amount.checked_div(100).ok_or(ZKError::MathOverflow)?;
+        let net_amount = amount.checked_sub(fee).ok_or(ZKError::MathOverflow)?;
+
+        // Transfer tokens from lending pool escrow to borrower.
         let cpi_accounts = Transfer {
             from: ctx.accounts.lending_pool_token_account.to_account_info(),
             to: ctx.accounts.user_borrow_token_account.to_account_info(),
@@ -81,19 +106,24 @@ pub mod zk_lending_protocol {
         };
         token::transfer(
             CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
-            amount,
+            net_amount,
         )?;
 
-        // Update the borrower’s encrypted borrowed amount.
-        let borrower_account = &mut ctx.accounts.borrower_account;
+        // Update treasury with collected fee.
+        let treasury = &mut ctx.accounts.protocol_treasury;
+        treasury.total_fees_collected = treasury
+            .total_fees_collected
+            .checked_add(fee)
+            .ok_or(ZKError::MathOverflow)?;
+
+        // Update the borrower's encrypted borrowed amount.
         borrower_account.encrypted_borrowed = update_encrypted_value(
             borrower_account.encrypted_borrowed.clone(),
-            amount,
+            amount, // principal (before fee)
             true,
         );
 
-        // Update protocol state: total loans and liquidity.
-        let protocol_state = &mut ctx.accounts.protocol_state;
+        // Update protocol state.
         protocol_state.total_loans = protocol_state
             .total_loans
             .checked_add(amount)
@@ -108,9 +138,190 @@ pub mod zk_lending_protocol {
         Ok(())
     }
 
-    /// Repay borrowed funds. If fully repaid, collateral may eventually be unlocked.
+    /// Institutional borrowing instruction that checks a whitelist and applies a fixed interest rate.
+    pub fn institutional_borrow(
+        ctx: Context<InstitutionalBorrow>,
+        amount: u64,
+        zk_proof: Vec<u8>,
+    ) -> Result<()> {
+        require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
+
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
+        let borrower_account = &mut ctx.accounts.borrower_account;
+        let protocol_state = &mut ctx.accounts.protocol_state;
+        let institutional_pool = &ctx.accounts.institutional_pool;
+
+        // Check that the borrower is whitelisted.
+        require!(
+            institutional_pool.zk_whitelist.contains(&ctx.accounts.borrower.key()),
+            ZKError::UnauthorizedBorrower
+        );
+
+        // Flash loan protection.
+        if borrower_account.borrow_timestamp > 0 {
+            require!(
+                now - borrower_account.borrow_timestamp >= protocol_state.min_collateral_lock_time,
+                ZKError::CollateralLockTimeNotMet
+            );
+        }
+        borrower_account.borrow_timestamp = now;
+
+        // (For institutional pools, you may choose to use a fixed interest rate later.)
+        require!(
+            has_sufficient_collateral(
+                borrower_account.encrypted_collateral.clone(),
+                amount
+            ),
+            ZKError::InsufficientCollateral
+        );
+
+        // Deduct borrow fee.
+        let fee = amount.checked_div(100).ok_or(ZKError::MathOverflow)?;
+        let net_amount = amount.checked_sub(fee).ok_or(ZKError::MathOverflow)?;
+
+        // Transfer tokens.
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.lending_pool_token_account.to_account_info(),
+            to: ctx.accounts.user_borrow_token_account.to_account_info(),
+            authority: ctx.accounts.lending_pool_authority.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+            net_amount,
+        )?;
+
+        // Update treasury.
+        let treasury = &mut ctx.accounts.protocol_treasury;
+        treasury.total_fees_collected = treasury
+            .total_fees_collected
+            .checked_add(fee)
+            .ok_or(ZKError::MathOverflow)?;
+
+        // Update borrower's encrypted borrowed amount.
+        borrower_account.encrypted_borrowed = update_encrypted_value(
+            borrower_account.encrypted_borrowed.clone(),
+            amount,
+            true,
+        );
+
+        protocol_state.total_loans = protocol_state
+            .total_loans
+            .checked_add(amount)
+            .ok_or(ZKError::MathOverflow)?;
+        protocol_state.total_liquidity = protocol_state
+            .total_liquidity
+            .checked_sub(amount)
+            .ok_or(ZKError::MathOverflow)?;
+        protocol_state.utilization_rate =
+            calculate_utilization(protocol_state.total_loans, protocol_state.total_liquidity);
+
+        Ok(())
+    }
+
+    /// Delegated borrowing for DAOs/businesses that assign a credit line.
+    pub fn delegated_borrow(
+        ctx: Context<DelegatedBorrow>,
+        amount: u64,
+        zk_proof: Vec<u8>,
+    ) -> Result<()> {
+        require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
+
+        let delegated = &ctx.accounts.delegated_borrower;
+        // Check that the delegate is borrowing on behalf of the delegator.
+        require!(
+            delegated.delegate == ctx.accounts.borrower.key(),
+            ZKError::UnauthorizedBorrower
+        );
+        require!(
+            amount <= delegated.max_borrow_amount,
+            ZKError::BorrowLimitExceeded
+        );
+
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
+        let borrower_account = &mut ctx.accounts.borrower_account;
+        let protocol_state = &mut ctx.accounts.protocol_state;
+
+        if borrower_account.borrow_timestamp > 0 {
+            require!(
+                now - borrower_account.borrow_timestamp >= protocol_state.min_collateral_lock_time,
+                ZKError::CollateralLockTimeNotMet
+            );
+        }
+        borrower_account.borrow_timestamp = now;
+
+        require!(
+            has_sufficient_collateral(
+                borrower_account.encrypted_collateral.clone(),
+                amount
+            ),
+            ZKError::InsufficientCollateral
+        );
+
+        let fee = amount.checked_div(100).ok_or(ZKError::MathOverflow)?;
+        let net_amount = amount.checked_sub(fee).ok_or(ZKError::MathOverflow)?;
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.lending_pool_token_account.to_account_info(),
+            to: ctx.accounts.user_borrow_token_account.to_account_info(),
+            authority: ctx.accounts.lending_pool_authority.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+            net_amount,
+        )?;
+
+        let treasury = &mut ctx.accounts.protocol_treasury;
+        treasury.total_fees_collected = treasury
+            .total_fees_collected
+            .checked_add(fee)
+            .ok_or(ZKError::MathOverflow)?;
+
+        borrower_account.encrypted_borrowed = update_encrypted_value(
+            borrower_account.encrypted_borrowed.clone(),
+            amount,
+            true,
+        );
+
+        protocol_state.total_loans = protocol_state
+            .total_loans
+            .checked_add(amount)
+            .ok_or(ZKError::MathOverflow)?;
+        protocol_state.total_liquidity = protocol_state
+            .total_liquidity
+            .checked_sub(amount)
+            .ok_or(ZKError::MathOverflow)?;
+        protocol_state.utilization_rate =
+            calculate_utilization(protocol_state.total_loans, protocol_state.total_liquidity);
+
+        Ok(())
+    }
+
+    /// Repay borrowed funds; includes accrued interest.
     pub fn repay(ctx: Context<Repay>, amount: u64) -> Result<()> {
-        // Transfer tokens from the borrower back to the lending pool escrow.
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
+
+        let borrower_account = &mut ctx.accounts.borrower_account;
+        let protocol_state = &mut ctx.accounts.protocol_state;
+        let lending_pool = &mut ctx.accounts.lending_pool;
+
+        // Calculate time elapsed and accrued interest.
+        let time_elapsed = now.checked_sub(borrower_account.borrow_timestamp).unwrap_or(0);
+        // Simplified interest calculation:
+        // interest_due = principal * base_interest_rate * time_elapsed / (seconds in a year * 100)
+        let principal = borrower_account.encrypted_borrowed.clone().value;
+        let interest_due = principal
+            .checked_mul(protocol_state.base_interest_rate as u64)
+            .and_then(|v| v.checked_mul(time_elapsed as u64))
+            .and_then(|v| v.checked_div(31_536_000 * 100))
+            .ok_or(ZKError::MathOverflow)?;
+
+        let total_due = principal.checked_add(interest_due).ok_or(ZKError::MathOverflow)?;
+        require!(amount >= total_due, ZKError::RepayExceedsBorrow);
+
+        // Transfer repayment tokens from borrower to lending pool.
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_borrow_token_account.to_account_info(),
             to: ctx.accounts.lending_pool_token_account.to_account_info(),
@@ -121,23 +332,21 @@ pub mod zk_lending_protocol {
             amount,
         )?;
 
-        // Update the borrower's encrypted borrowed amount.
-        let borrower_account = &mut ctx.accounts.borrower_account;
-        require!(
-            has_sufficient_borrow(borrower_account.encrypted_borrowed.clone(), amount),
-            ZKError::RepayExceedsBorrow
-        );
-        borrower_account.encrypted_borrowed = update_encrypted_value(
-            borrower_account.encrypted_borrowed.clone(),
-            amount,
-            false,
-        );
+        // Distribute a portion of repayment as yield farming rewards (e.g., 1%).
+        let reward = amount.checked_div(100).ok_or(ZKError::MathOverflow)?;
+        lending_pool.lender_rewards = lending_pool
+            .lender_rewards
+            .checked_add(reward)
+            .ok_or(ZKError::MathOverflow)?;
+
+        // Update borrower account: clear borrowed amount and reset timestamp.
+        borrower_account.encrypted_borrowed = reset_encryption();
+        borrower_account.borrow_timestamp = 0;
 
         // Update protocol state.
-        let protocol_state = &mut ctx.accounts.protocol_state;
         protocol_state.total_loans = protocol_state
             .total_loans
-            .checked_sub(amount)
+            .checked_sub(principal)
             .ok_or(ZKError::MathOverflow)?;
         protocol_state.total_liquidity = protocol_state
             .total_liquidity
@@ -149,13 +358,11 @@ pub mod zk_lending_protocol {
         Ok(())
     }
 
-    /// Liquidate an under-collateralized position using a ZK proof.
-    /// This anti-front-running mechanism hides the sensitive collateral details.
+    /// Partial liquidation: liquidate 50% of collateral if conditions are met.
     pub fn liquidate(ctx: Context<Liquidate>, zk_proof: Vec<u8>) -> Result<()> {
-        // Verify that liquidation conditions are met via a ZK proof.
-        require!(verify_zk_liquidation(&zk_proof), ZKError::InvalidProof);
+        require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
 
-        // Check that collateral is insufficient (dummy check).
+        // Check that collateral is insufficient.
         require!(
             !has_sufficient_collateral(
                 ctx.accounts.borrower_account.encrypted_collateral.clone(),
@@ -164,16 +371,23 @@ pub mod zk_lending_protocol {
             ZKError::LiquidationNotAllowed
         );
 
-        // Liquidate by transferring collateral value (encrypted) to the pool.
         let borrower_account = &mut ctx.accounts.borrower_account;
-        let liquidated_amount = extract_value_from_encryption(borrower_account.encrypted_collateral.clone());
-        borrower_account.encrypted_collateral = reset_encryption();
-
         let collateral_pool = &mut ctx.accounts.collateral_pool;
+
+        // Partial liquidation: liquidate 50% of the collateral.
+        let current_collateral = extract_value_from_encryption(borrower_account.encrypted_collateral.clone());
+        let liquidate_amount = current_collateral / 2;
+
+        borrower_account.encrypted_collateral = update_encrypted_value(
+            borrower_account.encrypted_collateral.clone(),
+            liquidate_amount,
+            false,
+        );
         collateral_pool.total_collateral = collateral_pool
             .total_collateral
-            .checked_sub(liquidated_amount)
+            .checked_sub(liquidate_amount)
             .ok_or(ZKError::MathOverflow)?;
+
         Ok(())
     }
 
@@ -194,14 +408,8 @@ pub mod zk_lending_protocol {
         Ok(())
     }
 
-    /// Governance: Vote on a proposal.
-    /// Only KYC’d institutional lenders can vote.
-    pub fn vote(
-        ctx: Context<Vote>,
-        proposal_id: u64,
-        vote: bool,
-    ) -> Result<()> {
-        // Ensure that the voter is in the institutional pool whitelist.
+    /// Governance: Vote on a proposal (only allowed for authorized voters).
+    pub fn vote(ctx: Context<Vote>, proposal_id: u64, vote: bool) -> Result<()> {
         require!(
             ctx.accounts.institutional_pool.zk_whitelist.contains(&ctx.accounts.voter.key()),
             ZKError::UnauthorizedVoter
@@ -210,7 +418,6 @@ pub mod zk_lending_protocol {
         let governance = &mut ctx.accounts.governance;
         require!(governance.proposal_id == proposal_id, ZKError::InvalidProposal);
 
-        // Simplified voting mechanism.
         if vote {
             governance.votes = governance
                 .votes
@@ -224,24 +431,33 @@ pub mod zk_lending_protocol {
         }
         Ok(())
     }
+
+    /// Rebalance collateral: adjust collateral without revealing details.
+    pub fn rebalance_collateral(
+        ctx: Context<RebalanceCollateral>,
+        additional_collateral: u64,
+        zk_proof: Vec<u8>,
+    ) -> Result<()> {
+        require!(verify_zk_proof(&zk_proof), ZKError::InvalidProof);
+        let borrower_account = &mut ctx.accounts.borrower_account;
+        // For simplicity, we add the additional collateral (could also support reductions).
+        borrower_account.encrypted_collateral = update_encrypted_value(
+            borrower_account.encrypted_collateral.clone(),
+            additional_collateral,
+            true,
+        );
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Dummy & Helper Functions (Replace with actual ZK logic)
+// Dummy & Helper Functions (Replace with actual ZK and confidential logic)
 // ─────────────────────────────────────────────────────────────
 
-/// Dummy ZK-SNARK verification for general operations.
 fn verify_zk_proof(_zk_proof: &Vec<u8>) -> bool {
     true
 }
 
-/// Dummy verification for liquidation-specific proofs.
-fn verify_zk_liquidation(_zk_proof: &Vec<u8>) -> bool {
-    true
-}
-
-/// Updates an encrypted value by adding or subtracting a given amount.
-/// In production, replace this with secure arithmetic on confidential values.
 fn update_encrypted_value(
     current: EncryptedAmount,
     amount: u64,
@@ -249,7 +465,7 @@ fn update_encrypted_value(
 ) -> EncryptedAmount {
     if add {
         EncryptedAmount {
-            value: current.value + amount,
+            value: current.value.checked_add(amount).unwrap_or(current.value),
         }
     } else {
         EncryptedAmount {
@@ -258,40 +474,31 @@ fn update_encrypted_value(
     }
 }
 
-/// Dummy check for sufficient collateral based on encrypted value.
 fn has_sufficient_collateral(encrypted_collateral: EncryptedAmount, amount: u64) -> bool {
     encrypted_collateral.value >= amount
 }
 
-/// Dummy check to ensure the borrower has enough borrowed balance for repayment.
-fn has_sufficient_borrow(encrypted_borrowed: EncryptedAmount, amount: u64) -> bool {
-    encrypted_borrowed.value >= amount
+fn reset_encryption() -> EncryptedAmount {
+    EncryptedAmount { value: 0 }
 }
 
-/// Calculate the utilization rate as a percentage.
-fn calculate_utilization(total_loans: u64, total_liquidity: u64) -> u8 {
-    if total_liquidity == 0 {
-        return 0;
-    }
-    ((total_loans as u128 * 100 / total_liquidity as u128) as u8)
-}
-
-/// Dummy function to extract a plain value from an encrypted amount.
 fn extract_value_from_encryption(encrypted: EncryptedAmount) -> u64 {
     encrypted.value
 }
 
-/// Dummy function to reset an encrypted amount.
-fn reset_encryption() -> EncryptedAmount {
-    EncryptedAmount { value: 0 }
+fn calculate_utilization(total_loans: u64, total_liquidity: u64) -> u8 {
+    if total_liquidity == 0 {
+        0
+    } else {
+        ((total_loans as u128 * 100 / total_liquidity as u128) as u8)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
 // Data Structures & Accounts
 // ─────────────────────────────────────────────────────────────
 
-/// A dummy structure representing an encrypted amount.
-/// In production, integrate with your ZK confidential token/encryption scheme.
+/// Represents an encrypted amount (placeholder for real ZK encryption).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct EncryptedAmount {
     pub value: u64,
@@ -303,8 +510,9 @@ pub struct ProtocolState {
     pub total_collateral: u64,
     pub total_loans: u64,
     pub total_liquidity: u64,
-    pub base_interest_rate: u8, // e.g., 5%
+    pub base_interest_rate: u8,
     pub utilization_rate: u8,
+    pub min_collateral_lock_time: i64,
 }
 
 /// Lending pool state.
@@ -314,61 +522,79 @@ pub struct LendingPool {
     pub total_liquidity: u64,
     pub base_interest_rate: u8,
     pub utilization_rate: u8,
+    pub lender_rewards: u64,
 }
 
 /// Multi-collateral pool state.
 #[account]
 pub struct CollateralPool {
-    pub asset_mint: Pubkey, // e.g., USDC, SOL, USDT
+    pub asset_mint: Pubkey,
     pub total_collateral: u64,
 }
 
 /// Institutional lending pool state.
 #[account]
 pub struct InstitutionalLendingPool {
-    pub pool_owner: Pubkey,       // Owner/manager of the pool
+    pub pool_owner: Pubkey,
     pub total_liquidity: u64,
-    pub zk_whitelist: Vec<Pubkey>, // List of KYC’d lenders
+    pub fixed_interest_rate: u8,
+    pub zk_whitelist: Vec<Pubkey>,
 }
 
-/// Borrower confidential account storing encrypted amounts.
+/// Treasury account for collecting protocol fees.
+#[account]
+pub struct ProtocolTreasury {
+    pub total_fees_collected: u64,
+    pub governance_fund: u64,
+}
+
+/// Borrower account storing confidential collateral and borrow amounts.
 #[account]
 pub struct BorrowerAccount {
-    pub encrypted_collateral: EncryptedAmount, // Encrypted collateral amount
-    pub encrypted_borrowed: EncryptedAmount,   // Encrypted borrowed amount
+    pub encrypted_collateral: EncryptedAmount,
+    pub encrypted_borrowed: EncryptedAmount,
+    pub borrow_timestamp: i64,
 }
 
-/// Borrower reputation account (for ZK reputation system).
+/// Borrower reputation (for a ZK-based reputation system).
 #[account]
 pub struct BorrowerReputation {
     pub borrower: Pubkey,
-    pub zk_reputation_score: u64, // Encrypted reputation score
+    pub zk_reputation_score: u64,
 }
 
-/// Governance proposal account.
+/// Governance proposal.
 #[account]
 pub struct Governance {
     pub proposal_id: u64,
-    pub proposal_type: u8, // (1 = Change Interest, 2 = Adjust Collateral Factor, etc.)
+    pub proposal_type: u8,
     pub new_value: u64,
     pub votes: i64,
+}
+
+/// Delegated borrower: credit line assigned by a delegator.
+#[account]
+pub struct DelegatedBorrower {
+    pub delegator: Pubkey,
+    pub delegate: Pubkey,
+    pub max_borrow_amount: u64,
 }
 
 // ─────────────────────────────────────────────────────────────
 // Contexts
 // ─────────────────────────────────────────────────────────────
 
-/// Context for initializing the protocol.
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 8*3 + 1*2)]
+    #[account(init, payer = user, space = 8 + 32)]
     pub protocol_state: Account<'info, ProtocolState>,
+    #[account(init, payer = user, space = 8 + 16)]
+    pub protocol_treasury: Account<'info, ProtocolTreasury>,
     #[account(mut)]
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
-/// Context for staking collateral.
 #[derive(Accounts)]
 pub struct StakeCollateral<'info> {
     #[account(mut)]
@@ -385,7 +611,6 @@ pub struct StakeCollateral<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Context for borrowing funds.
 #[derive(Accounts)]
 pub struct Borrow<'info> {
     #[account(mut)]
@@ -394,7 +619,7 @@ pub struct Borrow<'info> {
     pub borrower_account: Account<'info, BorrowerAccount>,
     #[account(mut)]
     pub lending_pool: Account<'info, LendingPool>,
-    /// CHECK: Safe as we derive authority via PDA.
+    /// CHECK: PDA derived authority.
     pub lending_pool_authority: AccountInfo<'info>,
     #[account(mut)]
     pub lending_pool_token_account: Account<'info, TokenAccount>,
@@ -402,11 +627,58 @@ pub struct Borrow<'info> {
     pub user_borrow_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub protocol_state: Account<'info, ProtocolState>,
+    #[account(mut)]
+    pub protocol_treasury: Account<'info, ProtocolTreasury>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
-/// Context for repaying loans.
+#[derive(Accounts)]
+pub struct InstitutionalBorrow<'info> {
+    #[account(mut)]
+    pub borrower: Signer<'info>,
+    #[account(mut)]
+    pub borrower_account: Account<'info, BorrowerAccount>,
+    #[account(mut)]
+    pub lending_pool: Account<'info, LendingPool>,
+    /// CHECK: PDA derived authority.
+    pub lending_pool_authority: AccountInfo<'info>,
+    #[account(mut)]
+    pub lending_pool_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_borrow_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub protocol_state: Account<'info, ProtocolState>,
+    #[account(mut)]
+    pub protocol_treasury: Account<'info, ProtocolTreasury>,
+    pub institutional_pool: Account<'info, InstitutionalLendingPool>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DelegatedBorrow<'info> {
+    #[account(mut)]
+    pub borrower: Signer<'info>,
+    #[account(mut)]
+    pub borrower_account: Account<'info, BorrowerAccount>,
+    #[account(mut)]
+    pub lending_pool: Account<'info, LendingPool>,
+    /// CHECK: PDA derived authority.
+    pub lending_pool_authority: AccountInfo<'info>,
+    #[account(mut)]
+    pub lending_pool_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_borrow_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub protocol_state: Account<'info, ProtocolState>,
+    #[account(mut)]
+    pub protocol_treasury: Account<'info, ProtocolTreasury>,
+    pub delegated_borrower: Account<'info, DelegatedBorrower>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
 #[derive(Accounts)]
 pub struct Repay<'info> {
     #[account(mut)]
@@ -415,7 +687,7 @@ pub struct Repay<'info> {
     pub borrower_account: Account<'info, BorrowerAccount>,
     #[account(mut)]
     pub lending_pool: Account<'info, LendingPool>,
-    /// CHECK: Safe as we derive authority via PDA.
+    /// CHECK: PDA derived authority.
     pub lending_pool_authority: AccountInfo<'info>,
     #[account(mut)]
     pub lending_pool_token_account: Account<'info, TokenAccount>,
@@ -423,11 +695,12 @@ pub struct Repay<'info> {
     pub user_borrow_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub protocol_state: Account<'info, ProtocolState>,
+    #[account(mut)]
+    pub protocol_treasury: Account<'info, ProtocolTreasury>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
-/// Context for liquidating a borrower's position.
 #[derive(Accounts)]
 pub struct Liquidate<'info> {
     #[account(mut)]
@@ -440,7 +713,6 @@ pub struct Liquidate<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Context for proposing a governance change.
 #[derive(Accounts)]
 pub struct ProposeChange<'info> {
     #[account(mut)]
@@ -450,7 +722,6 @@ pub struct ProposeChange<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Context for voting on a governance proposal.
 #[derive(Accounts)]
 pub struct Vote<'info> {
     #[account(mut)]
@@ -459,6 +730,15 @@ pub struct Vote<'info> {
     pub governance: Account<'info, Governance>,
     #[account(mut)]
     pub institutional_pool: Account<'info, InstitutionalLendingPool>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RebalanceCollateral<'info> {
+    #[account(mut)]
+    pub borrower: Signer<'info>,
+    #[account(mut)]
+    pub borrower_account: Account<'info, BorrowerAccount>,
     pub system_program: Program<'info, System>,
 }
 
@@ -482,4 +762,11 @@ pub enum ZKError {
     InvalidProposal,
     #[msg("Collateral still sufficient, liquidation not allowed")]
     CollateralSufficient,
+    #[msg("Collateral lock time has not been met for flash loan protection")]
+    CollateralLockTimeNotMet,
+    #[msg("Unauthorized borrower")]
+    UnauthorizedBorrower,
+    #[msg("Borrow amount exceeds delegated credit limit")]
+    BorrowLimitExceeded,
 }
+
