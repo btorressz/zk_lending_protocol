@@ -3,7 +3,8 @@
 
 `zk-lending-protocol` is a Solana-based decentralized lending protocol built with [Anchor] It leverages zero-knowledge proofs (ZKPs) to ensure privacy and security in lending and borrowing operations. The protocol supports features such as staking collateral, borrowing, repaying loans, liquidations, and governance.
 
-***NOTE THIS PROJECT IS TO PRACTICE MY ZK SKILLS WITH SOLANA**
+
+**NOTE THIS PROJECT IS TO PRACTICE MY ZK SKILLS WITH SOLANA**
 
 ## Features
 
